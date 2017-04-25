@@ -16,7 +16,6 @@ channels = 'bob,water,cake'
 url_param = url_param +'&filter=sync_gateway/bychannel&channels='+channels
 '''
 
-
 '''
 ### Saving My App's Checkpoint inside Sync Gateway ###
 HTTP/1.1 PUT or GET
