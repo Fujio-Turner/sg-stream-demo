@@ -5,7 +5,7 @@ import requests #Python Request libary for handling streaming HTTP link is here:
 
 url_param = "?feed=continuous&include_docs=true&since=0"
 
-r = requests.get('http://localhost:4984/sync_gateway/_changes'+url_param, stream=True)
+r = requests.get('http://admin:pass@localhost:4984/todo/_changes'+url_param, stream=True)
 
 for line in r.iter_lines():
 	if line:
