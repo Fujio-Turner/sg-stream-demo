@@ -102,12 +102,12 @@ payload["channels"] = channels
 
 #### Run HTTP Changes Feed:
 ```bash
-python sg_feed.py
+python3 sg_feed.py
 ```
 
 #### Run WebSocket Changes Feed:
 ```bash
-python sg_websocket_feed.py
+python3 sg_websocket_feed.py
 ```
 
 ### 6. Testing
