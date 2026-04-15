@@ -1,7 +1,7 @@
 {
   "gateway": {
     "src": "sync_gateway",
-    "url": "http://localhost:4984",
+    "url": "http://host.docker.internal:4984",
     "database": "db",
     "scope": "us",
     "collection": "prices",
@@ -38,7 +38,8 @@
   "checkpoint": {
     "enabled": true,
     "client_id": "changes_worker",
-    "file": "checkpoint.json"
+    "file": "checkpoint.json",
+    "every_n_docs": 0
   },
   "output": {
     "mode": "stdout",
@@ -59,6 +60,7 @@
     "halt_on_failure": true,
     "log_response_times": true,
     "output_format": "json",
+    "dead_letter_path": "failed_docs.jsonl",
     "request_options": {
       "params": {},
       "headers": {}
@@ -71,7 +73,7 @@
     "retry_on_status": [500, 502, 503, 504]
   },
   "metrics": {
-    "enabled": false,
+    "enabled": true,
     "host": "0.0.0.0",
     "port": 9090
   },

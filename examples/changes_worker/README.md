@@ -1,8 +1,10 @@
-# Changes Worker
+# Changes Worker  v1.1.0
 
 A production-ready, async Python 3 processor for the Couchbase `_changes` feed. It connects to **Sync Gateway**, **Capella App Services**, or **Couchbase Edge Server**, consumes document changes via longpoll, and forwards them to a downstream consumer — either as standard output or as HTTP requests (PUT/POST/DELETE) to any endpoint.
 
 Built for real-world workloads: checkpoint management so you never re-process, throttled feed consumption for large datasets, configurable retry with exponential backoff on both the source and destination sides, and full async concurrency control.
+
+![Changes Worker Architecture](img/architecture.png)
 
 ---
 
@@ -34,6 +36,27 @@ Built for real-world workloads: checkpoint management so you never re-process, t
 3. **Fetch** — If `include_docs=false`, fetch full docs via `_bulk_get` (SG/App Services) or individual `GET` (Edge Server), in batches of `get_batch_number`
 4. **Forward** — Serialize each doc (JSON, XML, msgpack, etc.) and send to stdout or an HTTP endpoint
 5. **Checkpoint** — Save `last_seq` to a `_local/` doc on SG (CBL-style) so restarts resume exactly where they left off
+
+---
+
+## One Process Per Collection
+
+Unlike Couchbase Lite, which can open and sync multiple collections in a single connection, the Sync Gateway / App Services / Edge Server `_changes` API serves **one collection at a time**. This means:
+
+- **Each changes_worker process monitors exactly one collection.**
+- To watch multiple collections, run **one container (or process) per collection**, each with its own `config.json` pointing at a different `scope` + `collection`.
+
+For example, to monitor three collections you would run three instances:
+
+```
+┌──────────────────┐   ┌──────────────────┐   ┌──────────────────┐
+│  changes_worker  │   │  changes_worker  │   │  changes_worker  │
+│  us.prices       │   │  us.inventory    │   │  eu.orders       │
+│  config-a.json   │   │  config-b.json   │   │  config-c.json   │
+└──────────────────┘   └──────────────────┘   └──────────────────┘
+```
+
+Each instance maintains its own checkpoint, retry state, and metrics independently. When running with Docker Compose, define one service per collection (or use `docker compose up --scale` with per-instance config mounts).
 
 ---
 
@@ -137,7 +160,8 @@ All settings live in a single `config.json` file. Here is a complete reference w
   "checkpoint": {
     "enabled": true,                 // Persist last_seq between runs
     "client_id": "changes_worker",   // Used in CBL-style checkpoint key derivation
-    "file": "checkpoint.json"        // Local fallback file if SG is unreachable
+    "file": "checkpoint.json",        // Local fallback file if SG is unreachable
+    "every_n_docs": 0                // Save checkpoint every N docs within a batch (0 = per-batch)
   },
 
   "output": {
@@ -159,6 +183,7 @@ All settings live in a single `config.json` file. Here is a complete reference w
     "halt_on_failure": true,         // Stop & freeze checkpoint if output fails
     "log_response_times": true,      // Track min/max/avg response times per batch
     "output_format": "json",         // "json"|"xml"|"form"|"msgpack"|"cbor"|"bson"|"yaml"
+    "dead_letter_path": "failed_docs.jsonl", // JSONL file for docs that failed output delivery
     "request_options": {             // Extra options added to every output HTTP request
       "params": {},                  // Query-string parameters (e.g. {"batch":"ok"})
       "headers": {}                  // Custom headers (e.g. {"X-Source":"changes-worker"})
@@ -239,14 +264,14 @@ UUID = SHA1(client_id + gateway_url + channels)
 Doc path: {keyspace}/_local/checkpoint-{UUID}
 ```
 
-The checkpoint document contains:
+The checkpoint document follows the CBL convention — `remote` indicates a pull replication (reading the `_changes` feed), and `time` is an epoch timestamp:
 
 ```json
 {
   "client_id": "changes_worker",
   "SGs_Seq": "1500",
-  "dateTime": "2026-04-15T12:00:00+00:00",
-  "local_internal": 42
+  "time": 1768521600,
+  "remote": 42
 }
 ```
 
@@ -514,6 +539,8 @@ examples/changes_worker/
 ├── Dockerfile                # Container image
 ├── metrics.html              # Prometheus metrics reference (open in browser)
 ├── test_changes_worker.py    # Unit tests
+├── docs/
+│   └── DESIGN.md             # Architecture, failure modes & trade-offs
 └── README.md                 # This file
 ```
 

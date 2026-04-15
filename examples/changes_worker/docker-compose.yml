@@ -1,0 +1,8 @@
+services:
+  changes-worker:
+    build: .
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./config.json:/app/config.json:ro
+    restart: unless-stopped

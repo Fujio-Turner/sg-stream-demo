@@ -10,7 +10,7 @@ bulk_get fallback, async parallel or sequential processing, and
 forwarding results via stdout or HTTP.
 """
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 import argparse
 import asyncio
@@ -30,6 +30,7 @@ import urllib.parse
 import xml.etree.ElementTree as ET
 
 import aiohttp
+import aiohttp.web
 from icecream import ic
 
 # Optional serialization libraries – imported lazily so the worker starts
@@ -105,6 +106,8 @@ class MetricsCollector:
         self.output_delete_total: int = 0
         self.output_put_errors_total: int = 0
         self.output_delete_errors_total: int = 0
+        self.output_success_total: int = 0
+        self.dead_letter_total: int = 0
 
         # Bytes tracking
         self.bytes_received_total: int = 0     # bytes from _changes + bulk_get/GETs
@@ -223,6 +226,11 @@ class MetricsCollector:
         lines.append("# TYPE changes_worker_output_errors_by_method_total counter")
         lines.append(f'changes_worker_output_errors_by_method_total{{{labels},method="PUT"}} {self.output_put_errors_total}')
         lines.append(f'changes_worker_output_errors_by_method_total{{{labels},method="DELETE"}} {self.output_delete_errors_total}')
+
+        _counter("changes_worker_output_success_total",
+                 "Total output requests that succeeded.", self.output_success_total)
+        _counter("changes_worker_dead_letter_total",
+                 "Total documents written to the dead letter queue.", self.dead_letter_total)
 
         _gauge("changes_worker_output_endpoint_up",
                "Whether the output endpoint is reachable (1=up, 0=down).", self.output_endpoint_up)
@@ -557,12 +565,12 @@ class Checkpoint:
         doc id = _sync:local:{UUID}
         SG REST path = {keyspace}/_local/checkpoint-{UUID}
 
-    The checkpoint document contains:
+    The checkpoint document contains (CBL-compatible):
         {
             "client_id": "<local_client_id>",
             "SGs_Seq": "<last_seq>",
-            "dateTime": "<ISO-8601 timestamp>",
-            "local_internal": <monotonic counter>
+            "time": <epoch timestamp>,
+            "remote": <monotonic counter>
         }
     """
 
@@ -613,7 +621,7 @@ class Checkpoint:
             resp.release()
             self._seq = str(data.get("SGs_Seq", "0"))
             self._rev = data.get("_rev")
-            self._internal = data.get("local_internal", 0)
+            self._internal = data.get("remote", data.get("local_internal", 0))
             ic("checkpoint loaded from SG", self._seq, self._rev, self._internal)
         except ClientHTTPError as exc:
             if exc.status == 404:
@@ -637,12 +645,11 @@ class Checkpoint:
         async with self._lock:
             self._internal += 1
             self._seq = seq
-            now = datetime.now(timezone.utc).isoformat()
             body: dict = {
                 "client_id": self._client_id,
                 "SGs_Seq": seq,
-                "dateTime": now,
-                "local_internal": self._internal,
+                "time": int(time.time()),
+                "remote": self._internal,
             }
             if self._rev:
                 body["_rev"] = self._rev
@@ -673,8 +680,8 @@ class Checkpoint:
     def _save_fallback(self, seq: str) -> None:
         self._fallback_path.write_text(json.dumps({
             "SGs_Seq": seq,
-            "dateTime": datetime.now(timezone.utc).isoformat(),
-            "local_internal": self._internal,
+            "time": int(time.time()),
+            "remote": self._internal,
         }))
         ic("checkpoint saved to file", seq)
 
@@ -1021,15 +1028,15 @@ class OutputForwarder:
         """Map HTTP method to metrics key prefix: 'put' or 'delete'."""
         return "delete" if method == "DELETE" else "put"
 
-    async def send(self, doc: dict, method: str = "PUT") -> None:
-        """Send a single doc. Raises OutputEndpointDown if halt_on_failure."""
+    async def send(self, doc: dict, method: str = "PUT") -> dict:
+        """Send a single doc. Returns result dict with 'ok' bool. Raises OutputEndpointDown if halt_on_failure."""
         if self._mode == "stdout":
             self._send_stdout(doc)
             if self._metrics:
                 self._metrics.inc("output_requests_total")
                 mk = self._method_key(method)
                 self._metrics.inc(f"output_{mk}_total")
-            return
+            return {"ok": True, "doc_id": doc.get("_id", doc.get("id", "unknown")), "method": method}
 
         doc_id = doc.get("_id", doc.get("id", "unknown"))
         url = f"{self._target_url}/{doc_id}"
@@ -1038,7 +1045,7 @@ class OutputForwarder:
 
         if self._dry_run:
             logger.info("[DRY RUN] Would %s %s (%s, %d bytes)", method, url, content_type, body_len)
-            return
+            return {"ok": True, "doc_id": doc_id, "method": method, "dry_run": True}
 
         assert self._http is not None
         ic(method, url, self._output_format)
@@ -1065,6 +1072,9 @@ class OutputForwarder:
             logger.debug(
                 "OUTPUT %s %s -> %d (%.1fms)", method, url, status, elapsed_ms
             )
+            if self._metrics:
+                self._metrics.inc("output_success_total")
+            return {"ok": True, "doc_id": doc_id, "method": method, "status": status}
 
         except ClientHTTPError as exc:
             elapsed_ms = (time.monotonic() - t_start) * 1000
@@ -1087,6 +1097,7 @@ class OutputForwarder:
                 ) from exc
             else:
                 logger.warning("halt_on_failure=false – skipping doc %s", doc_id)
+                return {"ok": False, "doc_id": doc_id, "method": method, "status": exc.status, "error": exc.body[:500]}
 
         except RedirectHTTPError as exc:
             elapsed_ms = (time.monotonic() - t_start) * 1000
@@ -1108,6 +1119,7 @@ class OutputForwarder:
                 ) from exc
             else:
                 logger.warning("halt_on_failure=false – skipping doc %s", doc_id)
+                return {"ok": False, "doc_id": doc_id, "method": method, "status": exc.status, "error": exc.body[:500]}
 
         except (ConnectionError, ServerHTTPError, aiohttp.ClientError, asyncio.TimeoutError) as exc:
             elapsed_ms = (time.monotonic() - t_start) * 1000
@@ -1130,6 +1142,7 @@ class OutputForwarder:
                 ) from exc
             else:
                 logger.warning("halt_on_failure=false – skipping doc %s", doc_id)
+                return {"ok": False, "doc_id": doc_id, "method": method, "status": 0, "error": str(exc)[:500]}
 
     async def test_reachable(self) -> bool:
         """Quick health check – HEAD or GET the target URL root."""
@@ -1183,6 +1196,41 @@ def determine_method(change: dict) -> str:
     return "PUT"
 
 
+class DeadLetterQueue:
+    """
+    Append-only JSONL file for documents that failed output delivery.
+
+    Each line is a JSON object with the failed doc, error details, and timestamp.
+    When halt_on_failure=false, failed docs are written here so they are not
+    silently lost when the checkpoint advances.
+    """
+
+    def __init__(self, path: str):
+        self._path = Path(path) if path else None
+        self._lock = asyncio.Lock()
+
+    @property
+    def enabled(self) -> bool:
+        return self._path is not None
+
+    async def write(self, doc: dict, result: dict, seq: str | int) -> None:
+        if not self._path:
+            return
+        entry = {
+            "doc_id": result.get("doc_id", "unknown"),
+            "seq": str(seq),
+            "method": result.get("method", "PUT"),
+            "status": result.get("status", 0),
+            "error": result.get("error", ""),
+            "time": int(time.time()),
+            "doc": doc,
+        }
+        async with self._lock:
+            with open(self._path, "a") as f:
+                f.write(json.dumps(entry) + "\n")
+        logger.warning("Dead letter: doc %s (seq %s) written to %s", result.get("doc_id"), seq, self._path)
+
+
 # ---------------------------------------------------------------------------
 # Core: changes feed loop
 # ---------------------------------------------------------------------------
@@ -1225,6 +1273,8 @@ async def poll_changes(cfg: dict, src: str, shutdown_event: asyncio.Event,
     async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
         http = RetryableHTTP(session, retry_cfg)
         output = OutputForwarder(session, out_cfg, dry_run, metrics=metrics)
+        dlq = DeadLetterQueue(out_cfg.get("dead_letter_path", ""))
+        every_n_docs = cfg.get("checkpoint", {}).get("every_n_docs", 0)
 
         # If output is HTTP, verify the endpoint is reachable before starting
         if out_cfg.get("mode") == "http":
@@ -1369,8 +1419,10 @@ async def poll_changes(cfg: dict, src: str, shutdown_event: asyncio.Event,
 
             # Process changes – send each doc to the output
             output_failed = False
+            batch_success = 0
+            batch_fail = 0
 
-            async def process_one(change: dict) -> None:
+            async def process_one(change: dict) -> dict:
                 async with semaphore:
                     doc_id = change.get("id", "")
                     if feed_cfg.get("include_docs"):
@@ -1379,27 +1431,84 @@ async def poll_changes(cfg: dict, src: str, shutdown_event: asyncio.Event,
                         doc = docs_by_id.get(doc_id, change)
 
                     method = determine_method(change)
-                    await output.send(doc, method)
+                    result = await output.send(doc, method)
+                    result["_change"] = change
+                    result["_doc"] = doc
+                    return result
 
-            try:
-                if sequential:
-                    for change in filtered:
-                        await process_one(change)
-                else:
-                    tasks = [asyncio.create_task(process_one(c)) for c in filtered]
-                    done, _ = await asyncio.wait(tasks)
-                    for t in done:
-                        if t.exception():
-                            raise t.exception()
-            except OutputEndpointDown as exc:
-                output_failed = True
-                logger.error(
-                    "OUTPUT DOWN – not advancing checkpoint past since=%s: %s",
-                    since, exc,
-                )
+            # Sub-batch or full-batch processing
+            if every_n_docs > 0 and sequential:
+                # Sub-batch checkpointing: process every_n_docs, then save
+                for i in range(0, len(filtered), every_n_docs):
+                    sub_batch = filtered[i:i + every_n_docs]
+                    for change in sub_batch:
+                        try:
+                            result = await process_one(change)
+                            if result.get("ok"):
+                                batch_success += 1
+                            else:
+                                batch_fail += 1
+                                if dlq.enabled and metrics:
+                                    metrics.inc("dead_letter_total")
+                                await dlq.write(result["_doc"], result, change.get("seq", ""))
+                        except OutputEndpointDown as exc:
+                            output_failed = True
+                            logger.error("OUTPUT DOWN – not advancing checkpoint past since=%s: %s", since, exc)
+                            break
+                    if output_failed:
+                        break
+                    # Mid-batch checkpoint: use the seq of the last change in this sub-batch
+                    sub_seq = str(sub_batch[-1].get("seq", last_seq))
+                    since = sub_seq
+                    await checkpoint.save(since, http, base_url, basic_auth, auth_headers)
+                    if metrics:
+                        metrics.inc("checkpoint_saves_total")
+                        metrics.set("checkpoint_seq", since)
+            else:
+                # Full-batch processing (original behavior)
+                try:
+                    if sequential:
+                        for change in filtered:
+                            result = await process_one(change)
+                            if result.get("ok"):
+                                batch_success += 1
+                            else:
+                                batch_fail += 1
+                                if dlq.enabled and metrics:
+                                    metrics.inc("dead_letter_total")
+                                await dlq.write(result["_doc"], result, change.get("seq", ""))
+                    else:
+                        tasks = [asyncio.create_task(process_one(c)) for c in filtered]
+                        done, _ = await asyncio.wait(tasks)
+                        for t in done:
+                            if t.exception():
+                                raise t.exception()
+                            result = t.result()
+                            if result.get("ok"):
+                                batch_success += 1
+                            else:
+                                batch_fail += 1
+                                if dlq.enabled and metrics:
+                                    metrics.inc("dead_letter_total")
+                                await dlq.write(result["_doc"], result, result["_change"].get("seq", ""))
+                except OutputEndpointDown as exc:
+                    output_failed = True
+                    logger.error(
+                        "OUTPUT DOWN – not advancing checkpoint past since=%s: %s",
+                        since, exc,
+                    )
 
             if metrics:
                 metrics.inc("changes_processed_total", len(filtered))
+
+            # Batch summary
+            total = batch_success + batch_fail
+            if total > 0:
+                logger.info(
+                    "BATCH SUMMARY: %d/%d succeeded, %d failed%s",
+                    batch_success, total, batch_fail,
+                    f" ({batch_fail} written to dead letter queue)" if batch_fail and dlq.enabled else "",
+                )
 
             # Log output response time stats periodically
             output.log_stats()
@@ -1414,11 +1523,13 @@ async def poll_changes(cfg: dict, src: str, shutdown_event: asyncio.Event,
                 continue
 
             # Save checkpoint AFTER all changes in this batch are processed
-            since = str(last_seq)
-            await checkpoint.save(since, http, base_url, basic_auth, auth_headers)
-            if metrics:
-                metrics.inc("checkpoint_saves_total")
-                metrics.set("checkpoint_seq", since)
+            # (skipped if sub-batch checkpointing already saved incrementally)
+            if not (every_n_docs > 0 and sequential):
+                since = str(last_seq)
+                await checkpoint.save(since, http, base_url, basic_auth, auth_headers)
+                if metrics:
+                    metrics.inc("checkpoint_saves_total")
+                    metrics.set("checkpoint_seq", since)
 
             # When throttling: if we got a full batch there are more rows
             # waiting — loop immediately for the next bite. Only sleep once
