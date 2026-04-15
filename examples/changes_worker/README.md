@@ -37,6 +37,27 @@ Built for real-world workloads: checkpoint management so you never re-process, t
 
 ---
 
+## One Process Per Collection
+
+Unlike Couchbase Lite, which can open and sync multiple collections in a single connection, the Sync Gateway / App Services / Edge Server `_changes` API serves **one collection at a time**. This means:
+
+- **Each changes_worker process monitors exactly one collection.**
+- To watch multiple collections, run **one container (or process) per collection**, each with its own `config.json` pointing at a different `scope` + `collection`.
+
+For example, to monitor three collections you would run three instances:
+
+```
+┌──────────────────┐   ┌──────────────────┐   ┌──────────────────┐
+│  changes_worker  │   │  changes_worker  │   │  changes_worker  │
+│  us.prices       │   │  us.inventory    │   │  eu.orders       │
+│  config-a.json   │   │  config-b.json   │   │  config-c.json   │
+└──────────────────┘   └──────────────────┘   └──────────────────┘
+```
+
+Each instance maintains its own checkpoint, retry state, and metrics independently. When running with Docker Compose, define one service per collection (or use `docker compose up --scale` with per-instance config mounts).
+
+---
+
 ## Quick Start
 
 ### Prerequisites

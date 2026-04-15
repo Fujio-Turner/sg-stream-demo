@@ -120,3 +120,13 @@ Press `Ctrl+C` to stop the script.
 ## Important Note
 
 **Unlike Couchbase Lite, which can open and sync multiple collections at once, these HTTP and WebSocket change feed methods require a separate connection for each collection you want to monitor.**
+
+---
+
+## Examples
+
+The [`examples/`](examples/) directory contains production-ready implementations built on top of these basic feed scripts:
+
+| Example | Description |
+|---|---|
+| [**changes_worker**](examples/changes_worker/) | A full-featured, async `_changes` feed processor. Connects to Sync Gateway, App Services, or Edge Server and forwards document changes to any HTTP endpoint (PUT/POST/DELETE) or stdout. Includes checkpoint management, configurable retry with exponential backoff, output serialization (JSON, XML, msgpack, etc.), Prometheus metrics, Docker support, and dry-run mode. Designed to run as **one process/container per collection**. |
