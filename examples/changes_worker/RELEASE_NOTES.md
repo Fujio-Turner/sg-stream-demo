@@ -2,6 +2,44 @@
 
 ---
 
+## v1.1.0 — 2026-04-15
+
+### New Features
+
+- **Custom request options** (`output.request_options`) — Inject query-string parameters and custom HTTP headers into every output request. Configure `params` (e.g., `{"batch": "ok"}` → `?batch=ok`) and `headers` (e.g., `{"X-Source": "changes-worker"}`) via config.json.
+
+- **Dead letter queue** (`output.dead_letter_path`) — Failed output documents are written to an append-only JSONL file (`failed_docs.jsonl`) with full doc body, error details, seq, method, and timestamp. Prevents silent data loss when `halt_on_failure=false`.
+
+- **Per-doc result tracking** — `send()` now returns a result dict (`{"ok": true/false, "doc_id": ..., "status": ..., "error": ...}`) enabling fine-grained batch tracking. Every batch logs a summary: `BATCH SUMMARY: 7/10 succeeded, 3 failed (3 written to dead letter queue)`.
+
+- **Sub-batch checkpointing** (`checkpoint.every_n_docs`) — Save the checkpoint every N docs within a batch instead of only at the end. Reduces data loss on crash during large catch-ups (e.g., `every_n_docs: 1000` on a 100K batch → max 1,000 docs re-processed on restart vs all 100K). Requires `sequential: true`.
+
+- **New Prometheus metrics:**
+  - `output_success_total` — Total output requests that succeeded
+  - `dead_letter_total` — Total documents written to the dead letter queue
+
+- **Docker Compose support** — Added `docker-compose.yml` for containerized deployment with config bind-mount and metrics port exposure.
+
+### Changes
+
+- **CBL-compatible checkpoint format** — Checkpoint documents now use `time` (epoch integer) instead of `dateTime` (ISO string), and `remote` instead of `local_internal`, matching the Couchbase Lite convention where `remote` indicates a pull replication. Existing checkpoints with the old field names are read correctly (backward compatible).
+
+- **Explicit `aiohttp.web` import** — Fixed `AttributeError: module aiohttp has no attribute web` when running in containers.
+
+### Documentation
+
+- **One Process Per Collection** — New section in README explaining that each worker monitors exactly one collection, with a diagram showing multi-instance deployment.
+
+- **Design document** (`docs/DESIGN.md`) — Comprehensive architecture document covering the three-stage pipeline (LEFT/MIDDLE/RIGHT), sequential vs parallel trade-offs, checkpoint strategies, all failure modes, dead letter queue lifecycle, and recommended configurations with diagrams.
+
+- **Architecture diagrams** — Added visual diagrams for pipeline overview, sequential vs parallel processing, checkpoint strategies, failure modes flowchart, and dead letter queue lifecycle.
+
+- **Root README** — Added Examples section linking to changes_worker.
+
+- **`.gitignore`** — Updated with Python, macOS, Windows, IDE, and Docker Compose patterns.
+
+---
+
 ## v1.0.0 — 2026-04-15
 
 **Initial release.** A production-ready, async Python 3 processor for the Couchbase `_changes` feed.

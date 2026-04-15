@@ -392,6 +392,11 @@ class TestCheckpoint(unittest.TestCase):
             cp._save_fallback("99")
             data = json.loads(Path(path).read_text())
             self.assertEqual(data["SGs_Seq"], "99")
+            self.assertIn("time", data)
+            self.assertIsInstance(data["time"], int)
+            self.assertIn("remote", data)
+            self.assertNotIn("dateTime", data)
+            self.assertNotIn("local_internal", data)
         finally:
             os.unlink(path)
 
@@ -660,6 +665,202 @@ class TestSleepOrShutdown(unittest.TestCase):
 # ===================================================================
 # OutputForwarder – response time tracking
 # ===================================================================
+
+class TestOutputForwarderRequestOptions(unittest.TestCase):
+    """Tests for output.request_options (custom params & headers)."""
+
+    def test_defaults_to_empty(self):
+        session = MagicMock()
+        fwd = cw.OutputForwarder(session, _stdout_out_cfg(), dry_run=False)
+        self.assertEqual(fwd._extra_params, {})
+        self.assertEqual(fwd._extra_headers, {})
+
+    def test_picks_up_params_and_headers(self):
+        session = MagicMock()
+        cfg = _stdout_out_cfg(request_options={
+            "params": {"batch": "ok", "source": "cbl"},
+            "headers": {"X-Source": "changes-worker"},
+        })
+        fwd = cw.OutputForwarder(session, cfg, dry_run=False)
+        self.assertEqual(fwd._extra_params, {"batch": "ok", "source": "cbl"})
+        self.assertEqual(fwd._extra_headers, {"X-Source": "changes-worker"})
+
+    def test_http_send_passes_params_and_headers(self):
+        """Verify that send() forwards extra params and headers to the HTTP call."""
+        mock_http = MagicMock()
+        resp = AsyncMock()
+        resp.status = 200
+        resp.release = MagicMock()
+        mock_http.request = AsyncMock(return_value=resp)
+
+        session = MagicMock()
+        cfg = {
+            "mode": "http",
+            "target_url": "http://example.com/api",
+            "output_format": "json",
+            "target_auth": {"method": "none"},
+            "request_options": {
+                "params": {"batch": "ok"},
+                "headers": {"X-Region": "us-east-1"},
+            },
+            "retry": {"max_retries": 1, "backoff_base_seconds": 0,
+                      "backoff_max_seconds": 0, "retry_on_status": []},
+            "halt_on_failure": True,
+        }
+        fwd = cw.OutputForwarder(session, cfg, dry_run=False)
+        fwd._http = mock_http
+
+        doc = {"_id": "doc123", "val": 1}
+        asyncio.run(fwd.send(doc, "PUT"))
+
+        call_kwargs = mock_http.request.call_args
+        self.assertEqual(call_kwargs.kwargs.get("params") or call_kwargs[1].get("params"),
+                         {"batch": "ok"})
+        headers = call_kwargs.kwargs.get("headers") or call_kwargs[1].get("headers")
+        self.assertEqual(headers["X-Region"], "us-east-1")
+        self.assertEqual(headers["Content-Type"], "application/json")
+
+    def test_http_send_no_params_passes_none(self):
+        """When params is empty, None is passed (no query string)."""
+        mock_http = MagicMock()
+        resp = AsyncMock()
+        resp.status = 200
+        resp.release = MagicMock()
+        mock_http.request = AsyncMock(return_value=resp)
+
+        session = MagicMock()
+        cfg = {
+            "mode": "http",
+            "target_url": "http://example.com/api",
+            "output_format": "json",
+            "target_auth": {"method": "none"},
+            "retry": {"max_retries": 1, "backoff_base_seconds": 0,
+                      "backoff_max_seconds": 0, "retry_on_status": []},
+            "halt_on_failure": True,
+        }
+        fwd = cw.OutputForwarder(session, cfg, dry_run=False)
+        fwd._http = mock_http
+
+        asyncio.run(fwd.send({"_id": "doc1"}, "PUT"))
+
+        call_kwargs = mock_http.request.call_args
+        params = call_kwargs.kwargs.get("params") or call_kwargs[1].get("params")
+        self.assertIsNone(params)
+
+
+class TestDeadLetterQueue(unittest.TestCase):
+    """Tests for DeadLetterQueue."""
+
+    def test_disabled_when_no_path(self):
+        dlq = cw.DeadLetterQueue("")
+        self.assertFalse(dlq.enabled)
+
+    def test_enabled_when_path_set(self):
+        dlq = cw.DeadLetterQueue("failed.jsonl")
+        self.assertTrue(dlq.enabled)
+
+    def test_write_appends_jsonl(self):
+        with tempfile.NamedTemporaryFile(suffix=".jsonl", delete=False) as f:
+            path = f.name
+        try:
+            dlq = cw.DeadLetterQueue(path)
+            doc = {"_id": "doc1", "val": 42}
+            result = {"ok": False, "doc_id": "doc1", "method": "PUT", "status": 500, "error": "boom"}
+
+            asyncio.run(dlq.write(doc, result, "15"))
+
+            lines = Path(path).read_text().strip().split("\n")
+            self.assertEqual(len(lines), 1)
+            entry = json.loads(lines[0])
+            self.assertEqual(entry["doc_id"], "doc1")
+            self.assertEqual(entry["seq"], "15")
+            self.assertEqual(entry["status"], 500)
+            self.assertEqual(entry["error"], "boom")
+            self.assertEqual(entry["doc"], doc)
+            self.assertIn("time", entry)
+            self.assertIsInstance(entry["time"], int)
+
+            # Second write appends
+            asyncio.run(dlq.write({"_id": "doc2"}, {"ok": False, "doc_id": "doc2", "method": "DELETE", "status": 404, "error": "nope"}, "20"))
+            lines = Path(path).read_text().strip().split("\n")
+            self.assertEqual(len(lines), 2)
+        finally:
+            os.unlink(path)
+
+    def test_write_noop_when_disabled(self):
+        dlq = cw.DeadLetterQueue("")
+        asyncio.run(dlq.write({}, {}, "0"))
+
+
+class TestSendReturnsResultDict(unittest.TestCase):
+    """Tests that send() returns a result dict instead of None."""
+
+    def test_stdout_send_returns_ok(self):
+        session = MagicMock()
+        fwd = cw.OutputForwarder(session, _stdout_out_cfg(), dry_run=False)
+        with patch("sys.stdout") as mock_stdout:
+            mock_stdout.write = MagicMock()
+            mock_stdout.flush = MagicMock()
+            result = asyncio.run(fwd.send({"_id": "doc1"}, "PUT"))
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["doc_id"], "doc1")
+
+    def test_http_send_returns_ok_on_success(self):
+        mock_http = MagicMock()
+        resp = AsyncMock()
+        resp.status = 200
+        resp.release = MagicMock()
+        mock_http.request = AsyncMock(return_value=resp)
+
+        session = MagicMock()
+        cfg = {
+            "mode": "http", "target_url": "http://example.com",
+            "output_format": "json", "target_auth": {"method": "none"},
+            "retry": {"max_retries": 1, "backoff_base_seconds": 0,
+                      "backoff_max_seconds": 0, "retry_on_status": []},
+            "halt_on_failure": True,
+        }
+        fwd = cw.OutputForwarder(session, cfg, dry_run=False)
+        fwd._http = mock_http
+
+        result = asyncio.run(fwd.send({"_id": "doc1"}, "PUT"))
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["status"], 200)
+
+    def test_http_send_returns_fail_on_4xx_no_halt(self):
+        mock_http = MagicMock()
+        mock_http.request = AsyncMock(side_effect=cw.ClientHTTPError(400, "bad"))
+
+        session = MagicMock()
+        cfg = {
+            "mode": "http", "target_url": "http://example.com",
+            "output_format": "json", "target_auth": {"method": "none"},
+            "retry": {"max_retries": 1, "backoff_base_seconds": 0,
+                      "backoff_max_seconds": 0, "retry_on_status": []},
+            "halt_on_failure": False,
+        }
+        fwd = cw.OutputForwarder(session, cfg, dry_run=False)
+        fwd._http = mock_http
+
+        result = asyncio.run(fwd.send({"_id": "doc1"}, "PUT"))
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["status"], 400)
+        self.assertIn("bad", result["error"])
+
+
+class TestMetricsNewCounters(unittest.TestCase):
+    """Tests for output_success_total and dead_letter_total metrics."""
+
+    def test_new_counters_in_render(self):
+        m = cw.MetricsCollector("sync_gateway", "db")
+        m.inc("output_success_total", 5)
+        m.inc("dead_letter_total", 2)
+        body = m.render()
+        self.assertIn("changes_worker_output_success_total", body)
+        self.assertIn("} 5", body)
+        self.assertIn("changes_worker_dead_letter_total", body)
+        self.assertIn("} 2", body)
+
 
 class TestOutputForwarderStats(unittest.TestCase):
 
